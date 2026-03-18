@@ -61,25 +61,30 @@ function fetchOTP(config, targetEmail) {
         let resolved = false;
         let currentPhase = 'init';
 
+        console.log('IMAP接続開始:', config.host, config.port, config.user);
+
         const timeout = setTimeout(() => {
             if (!resolved) {
                 resolved = true;
                 try { imap.end(); } catch(e) {}
-                resolve({ status: 'pending', message: 'タイムアウト（30秒）', phase: currentPhase });
+                resolve({ status: 'pending', message: 'タイムアウト（90秒）', phase: currentPhase });
             }
-        }, 30000);
+        }, 90000);
 
         imap.once('error', (err) => {
+            console.log('IMAPエラー:', err.message);
             if (!resolved) {
                 resolved = true;
                 clearTimeout(timeout);
-                resolve({ status: 'error', message: 'IMAP接続エラー: ' + err.message, phase: 'connect' });
+                resolve({ status: 'error', message: 'IMAP接続エラー: ' + err.message, phase: currentPhase });
             }
         });
 
         imap.once('ready', () => {
+            console.log('IMAP ready');
             currentPhase = 'ready';
             imap.openBox('INBOX', false, (err, box) => {
+                console.log('INBOX opened');
                 currentPhase = 'openbox';
                 if (err) {
                     resolved = true;
