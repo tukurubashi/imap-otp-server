@@ -1,10 +1,41 @@
-// v2 - force rebuild
 const express = require('express');
 const Imap = require('imap');
 const { simpleParser } = require('mailparser');
 
 const app = express();
 app.use(express.json());
+
+// 取得済みメールのUIDをキャッシュ（重複取得防止）
+// key: user@host, value: { uid: timestamp }
+const processedEmails = new Map();
+const CACHE_EXPIRE_MS = 10 * 60 * 1000; // 10分でキャッシュ削除
+
+// 定期的にキャッシュをクリーンアップ
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, uids] of processedEmails.entries()) {
+        for (const [uid, timestamp] of Object.entries(uids)) {
+            if (now - timestamp > CACHE_EXPIRE_MS) {
+                delete uids[uid];
+            }
+        }
+        if (Object.keys(uids).length === 0) {
+            processedEmails.delete(key);
+        }
+    }
+}, 60000);
+
+function isProcessed(userHost, uid) {
+    const uids = processedEmails.get(userHost);
+    return uids && uids[uid];
+}
+
+function markProcessed(userHost, uid) {
+    if (!processedEmails.has(userHost)) {
+        processedEmails.set(userHost, {});
+    }
+    processedEmails.get(userHost)[uid] = Date.now();
+}
 
 // CORS対応
 app.use((req, res, next) => {
@@ -27,11 +58,18 @@ app.all('/api/otp', async (req, res) => {
     const params = req.method === 'POST' ? req.body : req.query;
     const { host, port, user, pass, security, targetEmail } = params;
 
+    console.log('[OTP] リクエスト受信 - targetEmail:', targetEmail);
+
     if (!host || !port || !user || !pass) {
         return res.json({
             status: 'error',
             message: 'host, port, user, pass は必須です'
         });
+    }
+
+    // targetEmailが指定されてない場合は警告
+    if (!targetEmail) {
+        console.log('[OTP] 警告: targetEmailが指定されていません');
     }
 
     const imapConfig = {
@@ -47,6 +85,8 @@ app.all('/api/otp', async (req, res) => {
 
     try {
         const result = await fetchOTP(imapConfig, targetEmail);
+        // レスポンスにtargetEmailを追加
+        result.requestedTargetEmail = targetEmail || 'none';
         return res.json(result);
     } catch (err) {
         return res.json({
@@ -125,10 +165,17 @@ app.all('/api/3dsecure', async (req, res) => {
 });
 
 // targetEmailに一致するメールを探す関数
-async function checkEmailsForTarget(imap, uids, targetEmail, timeout, callback) {
+async function checkEmailsForTarget(imap, uids, targetEmail, timeout, callback, userHost) {
     const { simpleParser } = require('mailparser');
+    const checkedMails = []; // デバッグ用
     
     for (const uid of uids) {
+        // 既に処理済みのUIDはスキップ
+        if (isProcessed(userHost, uid)) {
+            console.log(`スキップ（処理済み）UID:${uid}`);
+            continue;
+        }
+        
         try {
             const result = await new Promise((resolve, reject) => {
                 const fetch = imap.fetch([uid], { bodies: '', markSeen: false });
@@ -149,13 +196,21 @@ async function checkEmailsForTarget(imap, uids, targetEmail, timeout, callback) 
                             const body = parsed.text || '';
                             const date = parsed.date;
                             
-                            console.log(`チェック中 UID:${uid} To:${toHeader} Subject:${subject.substring(0, 30)}`);
+                            console.log(`チェック中 UID:${uid} To:${toHeader} targetEmail:${targetEmail} Subject:${subject.substring(0, 30)}`);
+                            
+                            // デバッグ用に記録
+                            checkedMails.push({
+                                uid: uid,
+                                to: toHeader.substring(0, 50),
+                                subject: subject.substring(0, 30),
+                                match: toHeader.toLowerCase().includes(targetEmail.toLowerCase())
+                            });
                             
                             // ToヘッダーにtargetEmailが含まれているかチェック
                             if (toHeader.toLowerCase().includes(targetEmail.toLowerCase())) {
                                 // パスコードメールかチェック
                                 if (!subject.includes('パスコード')) {
-                                    resolve({ match: false });
+                                    resolve({ match: false, reason: 'not_passcode' });
                                     return;
                                 }
                                 
@@ -174,6 +229,9 @@ async function checkEmailsForTarget(imap, uids, targetEmail, timeout, callback) 
                                     // 既読にする
                                     imap.addFlags([uid], ['\\Seen'], () => {});
                                     
+                                    // 処理済みとしてマーク（重複防止）
+                                    markProcessed(userHost, uid);
+                                    
                                     resolve({
                                         match: true,
                                         status: 'success',
@@ -181,7 +239,9 @@ async function checkEmailsForTarget(imap, uids, targetEmail, timeout, callback) 
                                         ageMinutes: Math.round(ageMinutes),
                                         messageDate: date.toISOString(),
                                         subject: subject,
-                                        toHeader: toHeader
+                                        toHeader: toHeader,
+                                        uid: uid,
+                                        targetEmail: targetEmail
                                     });
                                     return;
                                 }
@@ -213,7 +273,8 @@ async function checkEmailsForTarget(imap, uids, targetEmail, timeout, callback) 
         status: 'pending',
         message: '対象メールアドレス宛のメールが見つかりません',
         targetEmail: targetEmail,
-        checkedCount: uids.length
+        checkedCount: uids.length,
+        checkedMails: checkedMails.slice(0, 5) // 最初の5件のみ
     });
 }
 
@@ -222,6 +283,7 @@ function fetchOTP(config, targetEmail) {
         const imap = new Imap(config);
         let resolved = false;
         let currentPhase = 'init';
+        const userHost = `${config.user}@${config.host}`;
 
         console.log('IMAP接続開始:', config.host, config.port, config.user);
 
@@ -295,7 +357,7 @@ function fetchOTP(config, targetEmail) {
                             clearTimeout(timeout);
                             imap.end();
                             resolve(result);
-                        });
+                        }, userHost);
                         return;
                     }
 
