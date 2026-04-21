@@ -214,7 +214,7 @@ async function checkEmailsForTarget(imap, uids, targetEmail, timeout, callback, 
                                 const now = new Date();
                                 const ageMinutes = (now - date) / 1000 / 60;
                                 
-                                if (ageMinutes > 10) {
+                                if (ageMinutes > 3) {
                                     resolve({ match: false, reason: 'old' });
                                     return;
                                 }
