@@ -361,116 +361,14 @@ function fetchOTP(config, targetEmail) {
                         return;
                     }
 
-                    // targetEmailなしの場合は従来通り最新のメールを取得
-                    const unseenCount = results.length;
-                    const latestUid = results[results.length - 1];
-                    const fetch = imap.fetch([latestUid], { bodies: '', markSeen: false });
-
-                    fetch.on('message', (msg) => {
-                        let emailData = '';
-
-                        msg.on('body', (stream) => {
-                            stream.on('data', (chunk) => {
-                                emailData += chunk.toString('utf8');
-                            });
-                        });
-
-                        msg.once('end', async () => {
-                            try {
-                                const parsed = await simpleParser(emailData);
-                                const body = parsed.text || '';
-                                const subject = parsed.subject || '';
-                                const date = parsed.date;
-                                const toHeader = parsed.to ? (parsed.to.text || JSON.stringify(parsed.to)) : 'none';
-                                
-                                console.log('取得メール - To:', toHeader, 'Subject:', subject);
-
-                                // パスコードメールかチェック
-                                if (!subject.includes('パスコード')) {
-                                    resolved = true;
-                                    clearTimeout(timeout);
-                                    imap.end();
-                                    return resolve({
-                                        status: 'pending',
-                                        message: '最新の未読メールはパスコードメールではない',
-                                        subject: subject,
-                                        unseenCount: unseenCount
-                                    });
-                                }
-
-                                // 10分以内のメールか確認
-                                const now = new Date();
-                                const ageMinutes = (now - date) / 1000 / 60;
-
-                                if (ageMinutes > 10) {
-                                    resolved = true;
-                                    clearTimeout(timeout);
-                                    imap.end();
-                                    return resolve({
-                                        status: 'pending',
-                                        message: 'パスコードが古い（10分超過）',
-                                        ageMinutes: Math.round(ageMinutes),
-                                        subject: subject
-                                    });
-                                }
-
-                                // パスコード抽出（6桁数字）
-                                const match = body.match(/【パスコード】\s*(\d{6})/) || body.match(/(\d{6})/);
-
-                                if (match) {
-                                    // 既読にする
-                                    imap.addFlags([latestUid], ['\\Seen'], () => {});
-                                    
-                                    resolved = true;
-                                    clearTimeout(timeout);
-                                    imap.end();
-                                    return resolve({
-                                        status: 'success',
-                                        code: match[1],
-                                        ageMinutes: Math.round(ageMinutes),
-                                        messageDate: date.toISOString(),
-                                        subject: subject,
-                                        unseenCount: unseenCount
-                                    });
-                                }
-
-                                resolved = true;
-                                clearTimeout(timeout);
-                                imap.end();
-                                return resolve({
-                                    status: 'error',
-                                    message: 'パスコード抽出失敗',
-                                    subject: subject,
-                                    bodyPreview: body.substring(0, 300),
-                                    unseenCount: unseenCount
-                                });
-                            } catch (parseErr) {
-                                resolved = true;
-                                clearTimeout(timeout);
-                                imap.end();
-                                return resolve({ status: 'error', message: 'メール解析エラー: ' + parseErr.message, phase: 'parse' });
-                            }
-                        });
-                    });
-
-                    fetch.once('error', (err) => {
-                        resolved = true;
-                        clearTimeout(timeout);
-                        imap.end();
-                        resolve({ status: 'error', message: 'Fetchエラー: ' + err.message, phase: 'fetch' });
-                    });
-
-                    fetch.once('end', () => {
-                        if (!resolved) {
-                            setTimeout(() => {
-                                if (!resolved) {
-                                    resolved = true;
-                                    clearTimeout(timeout);
-                                    imap.end();
-                                    resolve({ status: 'pending', message: 'メール取得完了待ち', phase: 'fetch_end' });
-                                }
-                            }, 5000);
-                        }
+                    // targetEmailなしの場合はエラー（フィルタリングなしは危険）
+                    resolved = true;
+                    clearTimeout(timeout);
+                    imap.end();
+                    return resolve({
+                        status: 'error',
+                        message: 'targetEmailが指定されていません。フィルタリングなしでのOTP取得は無効化されています。',
+                        unseenCount: results.length
                     });
                 });
             });
