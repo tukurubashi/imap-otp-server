@@ -196,50 +196,59 @@ async function checkEmailsForTarget(imap, uids, targetEmail, timeout, callback, 
                             const body = parsed.text || '';
                             const date = parsed.date;
                             
-                            console.log(`チェック中 UID:${uid} To:${toHeader} Subject:${subject.substring(0, 30)}`);
+                            console.log(`チェック中 UID:${uid} To:${toHeader} targetEmail:${targetEmail} Subject:${subject.substring(0, 30)}`);
+                            
+                            const isMatch = toHeader.toLowerCase().includes(targetEmail.toLowerCase());
+                            console.log(`To一致チェック: ${isMatch}`);
                             
                             checkedMails.push({
                                 uid: uid,
                                 to: toHeader.substring(0, 50),
                                 subject: subject.substring(0, 30),
-                                match: toHeader.toLowerCase().includes(targetEmail.toLowerCase())
+                                match: isMatch
                             });
                             
-                            if (toHeader.toLowerCase().includes(targetEmail.toLowerCase())) {
-                                if (!subject.includes('パスコード')) {
-                                    resolve({ match: false, reason: 'not_passcode' });
-                                    return;
-                                }
-                                
-                                const now = new Date();
-                                const ageMinutes = (now - date) / 1000 / 60;
-                                
-                                if (ageMinutes > 3) {
-                                    resolve({ match: false, reason: 'old' });
-                                    return;
-                                }
-                                
-                                const codeMatch = body.match(/(\d{6})/);
-                                if (codeMatch) {
-                                    imap.addFlags([uid], ['\\Seen'], () => {});
-                                    markProcessed(userHost, uid);
-                                    
-                                    resolve({
-                                        match: true,
-                                        status: 'success',
-                                        code: codeMatch[1],
-                                        ageMinutes: Math.round(ageMinutes),
-                                        messageDate: date.toISOString(),
-                                        subject: subject,
-                                        toHeader: toHeader,
-                                        uid: uid,
-                                        targetEmail: targetEmail
-                                    });
-                                    return;
-                                }
+                            // Toが一致しない場合は次のメールへ
+                            if (!isMatch) {
+                                console.log(`To不一致 → 次のメールへ`);
+                                resolve({ match: false, reason: 'to_mismatch' });
+                                return;
                             }
                             
-                            resolve({ match: false });
+                            if (!subject.includes('パスコード')) {
+                                resolve({ match: false, reason: 'not_passcode' });
+                                return;
+                            }
+                            
+                            const now = new Date();
+                            const ageMinutes = (now - date) / 1000 / 60;
+                            
+                            if (ageMinutes > 3) {
+                                console.log(`古いメール（${Math.round(ageMinutes)}分前）→ 次のメールへ`);
+                                resolve({ match: false, reason: 'old' });
+                                return;
+                            }
+                            
+                            const codeMatch = body.match(/(\d{6})/);
+                            if (codeMatch) {
+                                imap.addFlags([uid], ['\\Seen'], () => {});
+                                markProcessed(userHost, uid);
+                                
+                                resolve({
+                                    match: true,
+                                    status: 'success',
+                                    code: codeMatch[1],
+                                    ageMinutes: Math.round(ageMinutes),
+                                    messageDate: date.toISOString(),
+                                    subject: subject,
+                                    toHeader: toHeader,
+                                    uid: uid,
+                                    targetEmail: targetEmail
+                                });
+                                return;
+                            }
+                            
+                            resolve({ match: false, reason: 'no_code' });
                         } catch (e) {
                             resolve({ match: false, error: e.message });
                         }
@@ -284,7 +293,7 @@ function fetchOTP(config, targetEmail) {
                 try { imap.end(); } catch(e) {}
                 resolve({ status: 'pending', message: 'タイムアウト（30秒）', phase: currentPhase });
             }
-        }, 30000);
+        }, 60000);
 
         imap.once('error', (err) => {
             console.log('IMAPエラー:', err.message);
@@ -309,7 +318,11 @@ function fetchOTP(config, targetEmail) {
                 }
 
                 currentPhase = 'search';
+                // targetEmailがあればTO条件も追加
                 const searchCriteria = ['UNSEEN', ['SUBJECT', 'パスコード']];
+                if (targetEmail) {
+                    searchCriteria.push(['TO', targetEmail]);
+                }
                 
                 console.log('検索条件:', JSON.stringify(searchCriteria));
                 console.log('targetEmail:', targetEmail);
@@ -378,7 +391,7 @@ function fetchRegUrl(config, targetEmail) {
                 try { imap.end(); } catch(e) {}
                 resolve({ status: 'pending', message: 'タイムアウト（30秒）', phase: currentPhase });
             }
-        }, 30000);
+        }, 60000);
 
         imap.once('error', (err) => {
             console.log('IMAPエラー:', err.message);
@@ -611,7 +624,7 @@ function fetch3DSecureOTP(config, cardLast4) {
                 try { imap.end(); } catch(e) {}
                 resolve({ status: 'pending', message: 'タイムアウト（30秒）', phase: currentPhase });
             }
-        }, 30000);
+        }, 60000);
 
         imap.once('error', (err) => {
             console.log('IMAPエラー:', err.message);
