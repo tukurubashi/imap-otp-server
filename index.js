@@ -26,19 +26,10 @@ app.all('/api/otp', async (req, res) => {
     const params = req.method === 'POST' ? req.body : req.query;
     const { host, port, user, pass, security, targetEmail } = params;
 
-    console.log('[OTP] リクエスト受信 - targetEmail:', targetEmail);
-
     if (!host || !port || !user || !pass) {
         return res.json({
             status: 'error',
             message: 'host, port, user, pass は必須です'
-        });
-    }
-
-    if (!targetEmail) {
-        return res.json({
-            status: 'error',
-            message: 'targetEmailは必須です'
         });
     }
 
@@ -55,7 +46,6 @@ app.all('/api/otp', async (req, res) => {
 
     try {
         const result = await fetchOTP(imapConfig, targetEmail);
-        result.requestedTargetEmail = targetEmail;
         return res.json(result);
     } catch (err) {
         return res.json({
@@ -99,41 +89,6 @@ app.all('/api/regurl', async (req, res) => {
     }
 });
 
-// 3Dセキュア認証コード取得エンドポイント
-app.all('/api/3dsecure', async (req, res) => {
-    const params = req.method === 'POST' ? req.body : req.query;
-    const { host, port, user, pass, security, cardLast4 } = params;
-
-    if (!host || !port || !user || !pass) {
-        return res.json({
-            status: 'error',
-            message: 'host, port, user, pass は必須です'
-        });
-    }
-
-    const imapConfig = {
-        user: user,
-        password: pass,
-        host: host,
-        port: parseInt(port, 10),
-        tls: security === 'SSL/TLS' || security === 'ssl' || security === 'tls' || port === '993',
-        tlsOptions: { rejectUnauthorized: false },
-        authTimeout: 15000,
-        connTimeout: 15000
-    };
-
-    try {
-        const result = await fetch3DSecureOTP(imapConfig, cardLast4);
-        return res.json(result);
-    } catch (err) {
-        return res.json({
-            status: 'error',
-            message: err.message
-        });
-    }
-});
-
-// OTP取得（v3.7.6方式：シンプルに最新1件）
 function fetchOTP(config, targetEmail) {
     return new Promise((resolve, reject) => {
         const imap = new Imap(config);
@@ -173,16 +128,13 @@ function fetchOTP(config, targetEmail) {
                 }
 
                 currentPhase = 'search';
-                // 検索条件：未読 + パスコード + TO（targetEmail指定時）
+                // 検索条件を構築（件名に「パスコード」を含む未読メールのみ、日付フィルタなし）
                 const searchCriteria = ['UNSEEN', ['SUBJECT', 'パスコード']];
                 if (targetEmail) {
                     searchCriteria.push(['TO', targetEmail]);
                 }
 
-                console.log('検索条件:', JSON.stringify(searchCriteria));
-
                 imap.search(searchCriteria, (err, results) => {
-                    console.log('検索結果数:', results ? results.length : 0);
                     currentPhase = 'search_done';
                     if (err) {
                         resolved = true;
@@ -203,7 +155,7 @@ function fetchOTP(config, targetEmail) {
                         });
                     }
 
-                    // 最新の1件だけ取得
+                    const unseenCount = results.length;
                     const latestUid = results[results.length - 1];
                     const fetch = imap.fetch([latestUid], { bodies: '', markSeen: false });
 
@@ -222,9 +174,6 @@ function fetchOTP(config, targetEmail) {
                                 const body = parsed.text || '';
                                 const subject = parsed.subject || '';
                                 const date = parsed.date;
-                                const toHeader = parsed.to ? parsed.to.text : '';
-
-                                console.log('取得メール - To:', toHeader, 'Subject:', subject.substring(0, 30));
 
                                 // パスコードメールかチェック
                                 if (!subject.includes('パスコード')) {
@@ -234,28 +183,29 @@ function fetchOTP(config, targetEmail) {
                                     return resolve({
                                         status: 'pending',
                                         message: '最新の未読メールはパスコードメールではない',
-                                        subject: subject
+                                        subject: subject,
+                                        unseenCount: unseenCount
                                     });
                                 }
 
-                                // 3分以内のメールか確認
+                                // 10分以内のメールか確認
                                 const now = new Date();
                                 const ageMinutes = (now - date) / 1000 / 60;
 
-                                if (ageMinutes > 3) {
+                                if (ageMinutes > 10) {
                                     resolved = true;
                                     clearTimeout(timeout);
                                     imap.end();
                                     return resolve({
                                         status: 'pending',
-                                        message: 'パスコードが古い（3分超過）',
+                                        message: 'パスコードが古い（10分超過）',
                                         ageMinutes: Math.round(ageMinutes),
                                         subject: subject
                                     });
                                 }
 
-                                // パスコード抽出
-                                const match = body.match(/(\d{6})/);
+                                // パスコード抽出（6桁数字）
+                                const match = body.match(/【パスコード】\s*(\d{6})/) || body.match(/(\d{6})/);
 
                                 if (match) {
                                     // 既読にする
@@ -270,8 +220,7 @@ function fetchOTP(config, targetEmail) {
                                         ageMinutes: Math.round(ageMinutes),
                                         messageDate: date.toISOString(),
                                         subject: subject,
-                                        toHeader: toHeader,
-                                        targetEmail: targetEmail
+                                        unseenCount: unseenCount
                                     });
                                 }
 
@@ -282,7 +231,8 @@ function fetchOTP(config, targetEmail) {
                                     status: 'error',
                                     message: 'パスコード抽出失敗',
                                     subject: subject,
-                                    bodyPreview: body.substring(0, 300)
+                                    bodyPreview: body.substring(0, 300),
+                                    unseenCount: unseenCount
                                 });
                             } catch (parseErr) {
                                 resolved = true;
@@ -361,6 +311,7 @@ function fetchRegUrl(config, targetEmail) {
 
                 currentPhase = 'search';
                 
+                // 登録メールと「既に登録済み」メールの両方を検索
                 const regSearchCriteria = ['UNSEEN', ['SUBJECT', '会員登録の手続き']];
                 const dupSearchCriteria = ['UNSEEN', ['SUBJECT', '既に登録済み']];
                 
@@ -375,6 +326,7 @@ function fetchRegUrl(config, targetEmail) {
                         console.log('既登録メール検索エラー:', err.message);
                     }
 
+                    // 「既に登録済み」メールがあるか確認
                     if (dupResults && dupResults.length > 0) {
                         const latestDupUid = dupResults[dupResults.length - 1];
                         const dupFetch = imap.fetch([latestDupUid], { bodies: '', markSeen: false });
@@ -393,6 +345,7 @@ function fetchRegUrl(config, targetEmail) {
                                     const now = new Date();
                                     const ageMinutes = (now - date) / 1000 / 60;
 
+                                    // 10分以内なら「既に登録済み」として処理
                                     if (ageMinutes <= 10) {
                                         imap.addFlags([latestDupUid], ['\\Seen'], () => {});
                                         resolved = true;
@@ -411,11 +364,13 @@ function fetchRegUrl(config, targetEmail) {
                         });
                         
                         dupFetch.once('end', () => {
+                            // 既登録チェック完了後、登録URLメールを検索
                             if (!resolved) {
                                 searchRegUrl();
                             }
                         });
                     } else {
+                        // 「既に登録済み」メールがない場合、直接登録URLを検索
                         searchRegUrl();
                     }
                 });
@@ -442,6 +397,7 @@ function fetchRegUrl(config, targetEmail) {
                             });
                         }
 
+                        const unseenCount = results.length;
                         const latestUid = results[results.length - 1];
                         const fetch = imap.fetch([latestUid], { bodies: '', markSeen: false });
 
@@ -461,6 +417,7 @@ function fetchRegUrl(config, targetEmail) {
                                     const subject = parsed.subject || '';
                                     const date = parsed.date;
 
+                                    // 登録メールかチェック
                                     if (!subject.includes('会員登録')) {
                                         resolved = true;
                                         clearTimeout(timeout);
@@ -468,10 +425,12 @@ function fetchRegUrl(config, targetEmail) {
                                         return resolve({
                                             status: 'pending',
                                             message: '最新の未読メールは登録メールではない',
-                                            subject: subject
+                                            subject: subject,
+                                            unseenCount: unseenCount
                                         });
                                     }
 
+                                    // 10分以内のメールか確認
                                     const now = new Date();
                                     const ageMinutes = (now - date) / 1000 / 60;
 
@@ -487,9 +446,12 @@ function fetchRegUrl(config, targetEmail) {
                                         });
                                     }
 
+                                    // 登録URL抽出
+                                    // パターン: https://www.pokemoncenter-online.com/new-customer/?token=...
                                     const urlMatch = body.match(/https:\/\/www\.pokemoncenter-online\.com\/new-customer\/\?token=[^\s\n\r]+/);
 
                                     if (urlMatch) {
+                                        // 既読にする
                                         imap.addFlags([latestUid], ['\\Seen'], () => {});
                                         
                                         resolved = true;
@@ -500,7 +462,8 @@ function fetchRegUrl(config, targetEmail) {
                                             url: urlMatch[0],
                                             ageMinutes: Math.round(ageMinutes),
                                             messageDate: date.toISOString(),
-                                            subject: subject
+                                            subject: subject,
+                                            unseenCount: unseenCount
                                         });
                                     }
 
@@ -511,7 +474,8 @@ function fetchRegUrl(config, targetEmail) {
                                         status: 'error',
                                         message: '登録URL抽出失敗',
                                         subject: subject,
-                                        bodyPreview: body.substring(0, 500)
+                                        bodyPreview: body.substring(0, 500),
+                                        unseenCount: unseenCount
                                     });
                                 } catch (parseErr) {
                                     resolved = true;
@@ -550,14 +514,48 @@ function fetchRegUrl(config, targetEmail) {
     });
 }
 
-// 3Dセキュア認証コード取得関数
-function fetch3DSecureOTP(config, cardLast4) {
+// メール変更URL取得エンドポイント
+app.all('/api/emailchange', async (req, res) => {
+    const params = req.method === 'POST' ? req.body : req.query;
+    const { host, port, user, pass, security, email } = params;
+
+    if (!host || !port || !user || !pass) {
+        return res.json({
+            status: 'error',
+            message: 'host, port, user, pass は必須です'
+        });
+    }
+
+    const imapConfig = {
+        user: user,
+        password: pass,
+        host: host,
+        port: parseInt(port, 10),
+        tls: security === 'SSL/TLS' || security === 'ssl' || security === 'tls' || port === '993',
+        tlsOptions: { rejectUnauthorized: false },
+        authTimeout: 15000,
+        connTimeout: 15000
+    };
+
+    try {
+        const result = await fetchEmailChangeUrl(imapConfig, email);
+        return res.json(result);
+    } catch (err) {
+        return res.json({
+            status: 'error',
+            message: err.message
+        });
+    }
+});
+
+// メール変更URL取得関数
+function fetchEmailChangeUrl(config, targetEmail) {
     return new Promise((resolve, reject) => {
         const imap = new Imap(config);
         let resolved = false;
         let currentPhase = 'init';
 
-        console.log('IMAP接続開始 (3Dセキュア):', config.host, config.port, config.user);
+        console.log('IMAP接続開始 (emailchange):', config.host, config.port, config.user);
 
         const timeout = setTimeout(() => {
             if (!resolved) {
@@ -577,10 +575,10 @@ function fetch3DSecureOTP(config, cardLast4) {
         });
 
         imap.once('ready', () => {
-            console.log('IMAP ready (3Dセキュア)');
+            console.log('IMAP ready (emailchange)');
             currentPhase = 'ready';
             imap.openBox('INBOX', false, (err, box) => {
-                console.log('INBOX opened');
+                console.log('INBOX opened (emailchange)');
                 currentPhase = 'openbox';
                 if (err) {
                     resolved = true;
@@ -590,16 +588,15 @@ function fetch3DSecureOTP(config, cardLast4) {
                 }
 
                 currentPhase = 'search';
-                const searchCriteria = [
-                    'UNSEEN',
-                    ['FROM', 'noreply-biz-pay@moneyforward.com'],
-                    ['SUBJECT', '認証コード']
-                ];
-
-                console.log('検索条件:', JSON.stringify(searchCriteria));
+                
+                // メールアドレス変更確認メールを検索（件名で判定）
+                const searchCriteria = ['UNSEEN', ['SUBJECT', 'メールアドレス変更']];
+                
+                if (targetEmail) {
+                    searchCriteria.push(['TO', targetEmail]);
+                }
 
                 imap.search(searchCriteria, (err, results) => {
-                    console.log('検索結果数:', results ? results.length : 0);
                     currentPhase = 'search_done';
                     if (err) {
                         resolved = true;
@@ -614,110 +611,69 @@ function fetch3DSecureOTP(config, cardLast4) {
                         imap.end();
                         return resolve({ 
                             status: 'pending', 
-                            message: '3Dセキュア認証メールなし',
-                            searchCriteria: JSON.stringify(searchCriteria)
+                            message: '未読のメール変更確認メールなし',
+                            searchCriteria: JSON.stringify(searchCriteria),
+                            targetEmail: targetEmail || 'none'
                         });
                     }
 
-                    // 最新の1件だけ取得
+                    const unseenCount = results.length;
+                    console.log('メール変更メール件数:', unseenCount);
+                    
+                    // 最新のメールのみ取得
                     const latestUid = results[results.length - 1];
+                    currentPhase = 'fetch';
                     const fetch = imap.fetch([latestUid], { bodies: '', markSeen: false });
 
                     fetch.on('message', (msg) => {
                         let emailData = '';
-
                         msg.on('body', (stream) => {
                             stream.on('data', (chunk) => {
                                 emailData += chunk.toString('utf8');
                             });
                         });
-
                         msg.once('end', async () => {
+                            currentPhase = 'parse';
                             try {
                                 const parsed = await simpleParser(emailData);
-                                const subject = parsed.subject || '';
                                 const body = parsed.text || '';
                                 const date = parsed.date;
+                                const subject = parsed.subject || '';
+                                const now = new Date();
+                                const ageMinutes = (now - date) / 1000 / 60;
 
-                                if (!subject.includes('認証コード')) {
+                                console.log('メール変更メール解析:', subject, '経過時間:', Math.round(ageMinutes), '分');
+
+                                // 10分以内のメールのみ有効
+                                if (ageMinutes > 10) {
                                     resolved = true;
                                     clearTimeout(timeout);
                                     imap.end();
                                     return resolve({
                                         status: 'pending',
-                                        message: '認証コードメールではない',
+                                        message: 'メールが古い（10分超過）',
+                                        ageMinutes: Math.round(ageMinutes),
                                         subject: subject
                                     });
                                 }
 
-                                const now = new Date();
-                                const ageMinutes = (now - date) / 1000 / 60;
+                                // メール変更確認URL抽出
+                                const urlMatch = body.match(/https:\/\/www\.pokemoncenter-online\.com\/mail-change-complete\/\?token=[^\s\n]+/);
 
-                                if (ageMinutes > 5) {
-                                    resolved = true;
-                                    clearTimeout(timeout);
-                                    imap.end();
-                                    return resolve({
-                                        status: 'pending',
-                                        message: '認証コードが古い（5分超過）',
-                                        ageMinutes: Math.round(ageMinutes)
-                                    });
-                                }
-
-                                // カード下4桁で照合（指定がある場合）
-                                if (cardLast4 && !body.includes(cardLast4)) {
-                                    resolved = true;
-                                    clearTimeout(timeout);
-                                    imap.end();
-                                    return resolve({
-                                        status: 'pending',
-                                        message: 'カード番号不一致',
-                                        cardLast4: cardLast4
-                                    });
-                                }
-
-                                // 認証コード抽出
-                                let otp_code = null;
-
-                                function isDateOrYear(num) {
-                                    if (num >= 202000 && num <= 203099) return true;
-                                    const yy = Math.floor(num / 10000);
-                                    const mm = Math.floor((num % 10000) / 100);
-                                    const dd = num % 100;
-                                    if (yy >= 20 && yy <= 35 && mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31) return true;
-                                    return false;
-                                }
-
-                                let match = body.match(/認証コード[^\d]*(\d{6})/);
-                                if (match && !isDateOrYear(parseInt(match[1]))) {
-                                    otp_code = match[1];
-                                }
-
-                                if (!otp_code) {
-                                    const all_6digits = body.match(/\b(\d{6})\b/g);
-                                    if (all_6digits) {
-                                        for (const candidate of all_6digits) {
-                                            const num = parseInt(candidate);
-                                            if (!isDateOrYear(num)) {
-                                                otp_code = candidate;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if (otp_code) {
+                                if (urlMatch) {
+                                    // 既読にする
                                     imap.addFlags([latestUid], ['\\Seen'], () => {});
-
+                                    
                                     resolved = true;
                                     clearTimeout(timeout);
                                     imap.end();
                                     return resolve({
                                         status: 'success',
-                                        code: otp_code,
+                                        url: urlMatch[0].trim(),
                                         ageMinutes: Math.round(ageMinutes),
                                         messageDate: date.toISOString(),
-                                        subject: subject
+                                        subject: subject,
+                                        unseenCount: unseenCount
                                     });
                                 }
 
@@ -726,9 +682,10 @@ function fetch3DSecureOTP(config, cardLast4) {
                                 imap.end();
                                 return resolve({
                                     status: 'error',
-                                    message: '認証コード抽出失敗',
+                                    message: 'メール変更URL抽出失敗',
                                     subject: subject,
-                                    bodyPreview: body.substring(0, 300)
+                                    bodyPreview: body.substring(0, 500),
+                                    unseenCount: unseenCount
                                 });
                             } catch (parseErr) {
                                 resolved = true;
