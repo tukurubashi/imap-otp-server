@@ -723,6 +723,213 @@ function fetchEmailChangeUrl(config, targetEmail) {
     });
 }
 
+// メール変更完了確認エンドポイント
+app.all('/api/emailchangecomplete', async (req, res) => {
+    const params = req.method === 'POST' ? req.body : req.query;
+    const { host, port, user, pass, security, email } = params;
+
+    if (!host || !port || !user || !pass) {
+        return res.json({
+            status: 'error',
+            message: 'host, port, user, pass は必須です'
+        });
+    }
+
+    const imapConfig = {
+        user: user,
+        password: pass,
+        host: host,
+        port: parseInt(port, 10),
+        tls: security === 'SSL/TLS' || security === 'ssl' || security === 'tls' || port === '993',
+        tlsOptions: { rejectUnauthorized: false },
+        authTimeout: 15000,
+        connTimeout: 15000
+    };
+
+    try {
+        const result = await fetchEmailChangeComplete(imapConfig, email);
+        return res.json(result);
+    } catch (err) {
+        return res.json({
+            status: 'error',
+            message: err.message
+        });
+    }
+});
+
+// メール変更完了確認関数
+function fetchEmailChangeComplete(config, targetEmail) {
+    return new Promise((resolve, reject) => {
+        const imap = new Imap(config);
+        let resolved = false;
+        let currentPhase = 'init';
+
+        console.log('IMAP接続開始 (emailchangecomplete):', config.host, config.port, config.user);
+
+        const timeout = setTimeout(() => {
+            if (!resolved) {
+                resolved = true;
+                try { imap.end(); } catch(e) {}
+                resolve({ status: 'pending', message: 'タイムアウト（90秒）', phase: currentPhase });
+            }
+        }, 90000);
+
+        imap.once('error', (err) => {
+            console.log('IMAPエラー:', err.message);
+            if (!resolved) {
+                resolved = true;
+                clearTimeout(timeout);
+                resolve({ status: 'error', message: 'IMAP接続エラー: ' + err.message, phase: currentPhase });
+            }
+        });
+
+        imap.once('ready', () => {
+            console.log('IMAP ready (emailchangecomplete)');
+            currentPhase = 'ready';
+            imap.openBox('INBOX', false, (err, box) => {
+                console.log('INBOX opened (emailchangecomplete)');
+                currentPhase = 'openbox';
+                if (err) {
+                    resolved = true;
+                    clearTimeout(timeout);
+                    imap.end();
+                    return resolve({ status: 'error', message: 'INBOX開けない: ' + err.message, phase: 'openbox' });
+                }
+
+                currentPhase = 'search';
+                
+                // 会員情報変更完了メールを検索（件名で判定）
+                const searchCriteria = ['UNSEEN', ['SUBJECT', '会員情報変更完了']];
+                
+                if (targetEmail) {
+                    searchCriteria.push(['TO', targetEmail]);
+                }
+
+                imap.search(searchCriteria, (err, results) => {
+                    currentPhase = 'search_done';
+                    if (err) {
+                        resolved = true;
+                        clearTimeout(timeout);
+                        imap.end();
+                        return resolve({ status: 'error', message: '検索エラー: ' + err.message, phase: 'search' });
+                    }
+
+                    if (!results || results.length === 0) {
+                        resolved = true;
+                        clearTimeout(timeout);
+                        imap.end();
+                        return resolve({ 
+                            status: 'pending', 
+                            message: '未読の完了メールなし',
+                            searchCriteria: JSON.stringify(searchCriteria),
+                            targetEmail: targetEmail || 'none'
+                        });
+                    }
+
+                    const unseenCount = results.length;
+                    console.log('完了メール件数:', unseenCount);
+                    
+                    // 最新のメールのみ取得
+                    const latestUid = results[results.length - 1];
+                    currentPhase = 'fetch';
+                    const fetch = imap.fetch([latestUid], { bodies: '', markSeen: false });
+
+                    fetch.on('message', (msg) => {
+                        let emailData = '';
+                        msg.on('body', (stream) => {
+                            stream.on('data', (chunk) => {
+                                emailData += chunk.toString('utf8');
+                            });
+                        });
+                        msg.once('end', async () => {
+                            currentPhase = 'parse';
+                            try {
+                                const parsed = await simpleParser(emailData);
+                                const body = parsed.text || '';
+                                const date = parsed.date;
+                                const subject = parsed.subject || '';
+                                const now = new Date();
+                                const ageMinutes = (now - date) / 1000 / 60;
+
+                                console.log('完了メール解析:', subject, '経過時間:', Math.round(ageMinutes), '分');
+
+                                // 5分以内のメールのみ有効
+                                if (ageMinutes > 5) {
+                                    resolved = true;
+                                    clearTimeout(timeout);
+                                    imap.end();
+                                    return resolve({
+                                        status: 'pending',
+                                        message: 'メールが古い（5分超過）',
+                                        ageMinutes: Math.round(ageMinutes),
+                                        subject: subject
+                                    });
+                                }
+
+                                // 完了メールの内容を確認
+                                if (body.includes('会員情報の変更が完了しました')) {
+                                    // 既読にする
+                                    imap.addFlags([latestUid], ['\\Seen'], () => {});
+                                    
+                                    resolved = true;
+                                    clearTimeout(timeout);
+                                    imap.end();
+                                    return resolve({
+                                        status: 'success',
+                                        message: '会員情報変更完了',
+                                        ageMinutes: Math.round(ageMinutes),
+                                        messageDate: date.toISOString(),
+                                        subject: subject,
+                                        unseenCount: unseenCount
+                                    });
+                                }
+
+                                resolved = true;
+                                clearTimeout(timeout);
+                                imap.end();
+                                return resolve({
+                                    status: 'pending',
+                                    message: '完了メールの内容が一致しない',
+                                    subject: subject,
+                                    bodyPreview: body.substring(0, 200),
+                                    unseenCount: unseenCount
+                                });
+                            } catch (parseErr) {
+                                resolved = true;
+                                clearTimeout(timeout);
+                                imap.end();
+                                return resolve({ status: 'error', message: 'メール解析エラー: ' + parseErr.message, phase: 'parse' });
+                            }
+                        });
+                    });
+
+                    fetch.once('error', (err) => {
+                        resolved = true;
+                        clearTimeout(timeout);
+                        imap.end();
+                        resolve({ status: 'error', message: 'Fetchエラー: ' + err.message, phase: 'fetch' });
+                    });
+
+                    fetch.once('end', () => {
+                        if (!resolved) {
+                            setTimeout(() => {
+                                if (!resolved) {
+                                    resolved = true;
+                                    clearTimeout(timeout);
+                                    imap.end();
+                                    resolve({ status: 'pending', message: 'メール取得完了待ち', phase: 'fetch_end' });
+                                }
+                            }, 5000);
+                        }
+                    });
+                });
+            });
+        });
+
+        imap.connect();
+    });
+}
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
